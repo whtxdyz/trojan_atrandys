@@ -165,7 +165,6 @@ EOF
 	unzip /usr/src/trojan-temp/trojan-${latest_version}-win.zip -d /usr/src/trojan-temp/ >/dev/null 2>&1
 	cp /usr/src/trojan-cert/fullchain.cer /usr/src/trojan-cli/fullchain.cer
 	mv -f /usr/src/trojan-temp/trojan/trojan.exe /usr/src/trojan-cli/ 
-	trojan_passwd=$(cat /dev/urandom | head -1 | md5sum | head -c 8)
 	cat > /usr/src/trojan-cli/config.json <<-EOF
 {
     "run_type": "client",
@@ -174,7 +173,7 @@ EOF
     "remote_addr": "$your_domain",
     "remote_port": $trojan_port,
     "password": [
-        "$trojan_passwd"
+        "$trojan_passwd_json"
     ],
     "log_level": 1,
     "ssl": {
@@ -208,7 +207,7 @@ EOF
     "remote_addr": "127.0.0.1",
     "remote_port": 80,
     "password": [
-        "$trojan_passwd"
+        "$trojan_passwd_json"
     ],
     "log_level": 1,
     "ssl": {
@@ -273,6 +272,7 @@ EOF
 	systemctl enable trojan.service
 	green "======================================================================"
 	green "Trojan已安装完成，连接端口：${trojan_port}"
+	printf 'Trojan 密码：%s\n' "$trojan_passwd"
 	green "请在云平台安全规则中放行TCP ${trojan_port}和80端口"
 	green "请使用以下链接下载trojan客户端，此客户端已配置好所有参数"
 	green "1、复制下面的链接，在浏览器打开，下载客户端，注意此下载链接将在1个小时后失效"
@@ -296,6 +296,39 @@ valid_trojan_port(){
     local port_number=$((10#$1))
     (( port_number >= 1 && port_number <= 65535 && port_number != 80 ))
 }
+# 将密码转义为 JSON 字符串内容，允许引号和反斜杠。
+prepare_password_json(){
+    local LC_ALL=C
+    [[ -n "$trojan_passwd" && ! "$trojan_passwd" =~ [[:cntrl:]] ]] || return 1
+    trojan_passwd_json=${trojan_passwd//\\/\\\\}
+    trojan_passwd_json=${trojan_passwd_json//\"/\\\"}
+}
+choose_trojan_password(){
+    local password_confirm
+    while true; do
+        IFS= read -r -s -p "请输入 Trojan 密码 [回车自动生成，输入不显示]：" trojan_passwd || return 1
+        printf '\n'
+        if [ -z "$trojan_passwd" ]; then
+            trojan_passwd=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n') || return 1
+            [ "${#trojan_passwd}" -eq 48 ] || return 1
+            prepare_password_json || return 1
+            green "已生成随机密码，安装成功后显示连接信息"
+            return 0
+        fi
+        if ! prepare_password_json; then
+            red "密码不能包含换行、制表符等控制字符，请重新输入"
+            continue
+        fi
+        IFS= read -r -s -p "请再次输入密码：" password_confirm || return 1
+        printf '\n'
+        if [ "$trojan_passwd" != "$password_confirm" ]; then
+            red "两次密码不一致，请重新输入"
+            continue
+        fi
+        return 0
+    done
+}
+
 choose_trojan_port(){
     local entered_port
     while true; do
@@ -324,6 +357,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 $systemPackage -y install net-tools socat || return 1
 choose_trojan_port || return 1
+choose_trojan_password || return 1
 nginx_status=`ps -aux | grep "nginx: worker" |grep -v "grep"`
 if [ -n "$nginx_status" ]; then
     systemctl stop nginx
