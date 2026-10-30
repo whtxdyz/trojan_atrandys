@@ -42,6 +42,78 @@ elif cat /proc/version | grep -Eqi "centos|red hat|redhat"; then
     systemPackage="yum"
     systempwd="/usr/lib/systemd/system/"
 fi
+# 证书申请、续期与部署：复用 Nginx 的80端口，保留现有Trojan端口和密码。
+setup_certificate(){
+    local cert_mode="${1:-install}"
+    local acme_status
+    local -a issue_options=()
+    if [ "$(id -u)" -ne 0 ]; then
+        red "请先执行 sudo -i，再运行本脚本"
+        return 1
+    fi
+    if [[ ! "$your_domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || [[ "$your_domain" != *.* ]]; then
+        red "域名格式不正确，只填写域名，不带协议、端口或路径"
+        return 1
+    fi
+    mkdir -p /usr/src/trojan-cert /usr/src/trojan-temp
+    mkdir -p /usr/share/nginx/html/.well-known/acme-challenge
+    nginx -t || return 1
+    systemctl enable nginx || return 1
+    systemctl restart nginx || return 1
+
+    # 确保每日续期任务有实际运行的 cron 服务。
+    if ! command -v crontab >/dev/null 2>&1; then
+        if [ "$release" = "centos" ]; then
+            yum -y install cronie || return 1
+        else
+            apt-get -y install cron || return 1
+        fi
+    fi
+    if [ "$release" = "centos" ]; then
+        systemctl enable --now crond || return 1
+    else
+        systemctl enable --now cron || return 1
+    fi
+
+    if [ ! -x /root/.acme.sh/acme.sh ]; then
+        local installer
+        installer=$(mktemp) || return 1
+        if ! curl -fsS https://get.acme.sh -o "$installer"; then
+            rm -f "$installer"
+            return 1
+        fi
+        sh "$installer"
+        acme_status=$?
+        rm -f "$installer"
+        [ "$acme_status" -eq 0 ] || return 1
+    fi
+    [ -x /root/.acme.sh/acme.sh ] || return 1
+    /root/.acme.sh/acme.sh --install-cronjob || return 1
+
+    if [ "$cert_mode" = "repair" ]; then
+        cp -a /usr/src/trojan-cert "/root/trojan-cert-backup-$(date +%Y%m%d-%H%M%S)" || return 1
+        issue_options+=(--force)
+    fi
+    /root/.acme.sh/acme.sh --issue \
+        -d "$your_domain" \
+        --webroot /usr/share/nginx/html \
+        --keylength ec-256 \
+        --server zerossl "${issue_options[@]}"
+    acme_status=$?
+    if [ "$acme_status" -ne 0 ] && [ "$acme_status" -ne 2 ]; then
+        red "证书申请失败：请检查域名解析、公网80端口和上方错误"
+        return 1
+    fi
+
+    /root/.acme.sh/acme.sh --install-cert \
+        -d "$your_domain" --ecc \
+        --key-file /usr/src/trojan-cert/private.key \
+        --fullchain-file /usr/src/trojan-cert/fullchain.cer \
+        --reloadcmd 'if systemctl cat trojan.service >/dev/null 2>&1; then systemctl restart trojan; fi' \
+        || return 1
+    openssl x509 -in /usr/src/trojan-cert/fullchain.cer -noout -subject -dates
+}
+
 function install(){
 cat > /etc/nginx/nginx.conf <<-EOF
 user  root;
@@ -76,18 +148,7 @@ EOF
 	cd /usr/share/nginx/html/
 	wget https://github.com/atrandys/v2ray-ws-tls/raw/master/web.zip >/dev/null 2>&1
     	unzip web.zip >/dev/null 2>&1
-	systemctl stop nginx
-	sleep 5
-	#申请https证书
-	if [ ! -d "/usr/src" ]; then
-	    mkdir /usr/src
-	fi
-	mkdir /usr/src/trojan-cert /usr/src/trojan-temp
-	curl https://get.acme.sh | sh
-	~/.acme.sh/acme.sh  --issue  -d $your_domain  --standalone
-    	~/.acme.sh/acme.sh  --installcert  -d  $your_domain   \
-        --key-file   /usr/src/trojan-cert/private.key \
-        --fullchain-file /usr/src/trojan-cert/fullchain.cer
+	setup_certificate install || return 1
 	if test -s /usr/src/trojan-cert/fullchain.cer; then
 	systemctl start nginx
         cd /usr/src
@@ -207,6 +268,7 @@ WantedBy=multi-user.target
 EOF
 
 	chmod +x ${systempwd}trojan.service
+	systemctl daemon-reload || return 1
 	systemctl start trojan.service
 	systemctl enable trojan.service
 	green "======================================================================"
@@ -338,43 +400,11 @@ fi
 }
 
 function repair_cert(){
-systemctl stop nginx
-iptables -I INPUT -p tcp --dport 80 -j ACCEPT
-iptables -I INPUT -p tcp --dport 443 -j ACCEPT
-Port80=`netstat -tlpn | awk -F '[: ]+' '$1=="tcp"{print $5}' | grep -w 80`
-if [ -n "$Port80" ]; then
-    process80=`netstat -tlpn | awk -F '[: ]+' '$5=="80"{print $9}'`
-    red "==========================================================="
-    red "检测到80端口被占用，占用进程为：${process80}，本次安装结束"
-    red "==========================================================="
-    exit 1
-fi
-green "======================="
-blue "请输入绑定到本VPS的域名"
-blue "务必与之前失败使用的域名一致"
-green "======================="
-read your_domain
-real_addr=`ping ${your_domain} -c 1 | sed '1{s/[^(]*(//;s/).*//;q}'`
-local_addr=`curl ipv4.icanhazip.com`
-if [ $real_addr == $local_addr ] ; then
-    ~/.acme.sh/acme.sh  --issue  -d $your_domain  --standalone
-    ~/.acme.sh/acme.sh  --installcert  -d  $your_domain   \
-        --key-file   /usr/src/trojan-cert/private.key \
-        --fullchain-file /usr/src/trojan-cert/fullchain.cer
-    if test -s /usr/src/trojan-cert/fullchain.cer; then
-        green "证书申请成功"
-	green "请将/usr/src/trojan-cert/下的fullchain.cer下载放到客户端trojan-cli文件夹"
-	systemctl restart trojan
-	systemctl start nginx
-    else
-    	red "申请证书失败"
-    fi
-else
-    red "================================"
-    red "域名解析地址与本VPS IP地址不一致"
-    red "本次安装失败，请确保域名解析正常"
-    red "================================"
-fi	
+    blue "请输入这台服务器绑定的域名（例如 623.ssccs.xyz）"
+    read -r your_domain
+    setup_certificate repair || return 1
+    green "证书已部署，自动续期与服务重启已配置"
+    green "如客户端使用单独保存的证书文件，请同步更新客户端证书"
 }
 
 function remove_trojan(){
