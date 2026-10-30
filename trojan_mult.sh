@@ -172,7 +172,7 @@ EOF
     "local_addr": "127.0.0.1",
     "local_port": 1080,
     "remote_addr": "$your_domain",
-    "remote_port": 443,
+    "remote_port": $trojan_port,
     "password": [
         "$trojan_passwd"
     ],
@@ -204,7 +204,7 @@ EOF
 {
     "run_type": "server",
     "local_addr": "0.0.0.0",
-    "local_port": 443,
+    "local_port": $trojan_port,
     "remote_addr": "127.0.0.1",
     "remote_port": 80,
     "password": [
@@ -272,7 +272,9 @@ EOF
 	systemctl start trojan.service
 	systemctl enable trojan.service
 	green "======================================================================"
-	green "Trojan已安装完成，请使用以下链接下载trojan客户端，此客户端已配置好所有参数"
+	green "Trojan已安装完成，连接端口：${trojan_port}"
+	green "请在云平台安全规则中放行TCP ${trojan_port}和80端口"
+	green "请使用以下链接下载trojan客户端，此客户端已配置好所有参数"
 	green "1、复制下面的链接，在浏览器打开，下载客户端，注意此下载链接将在1个小时后失效"
 	blue "http://${your_domain}/$trojan_path/trojan-cli.zip"
 	green "2、将下载的压缩包解压，打开文件夹，打开start.bat即打开并运行Trojan客户端"
@@ -288,14 +290,45 @@ EOF
 	red "==================================="
 	fi
 }
+# 80端口保留用于证书验证；Trojan端口由安装时选择。
+valid_trojan_port(){
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] || return 1
+    local port_number=$((10#$1))
+    (( port_number >= 1 && port_number <= 65535 && port_number != 80 ))
+}
+choose_trojan_port(){
+    local entered_port
+    while true; do
+        read -r -p "请输入 Trojan 连接端口 [默认443]：" entered_port || return 1
+        entered_port=${entered_port:-443}
+        if ! valid_trojan_port "$entered_port"; then
+            red "请输入1至65535的整数；80端口保留给证书验证"
+            continue
+        fi
+        trojan_port=$((10#$entered_port))
+        if netstat -lnt | awk -v port="$trojan_port" '
+            $1 ~ /^tcp/ { n=split($4,a,":"); if (a[n]==port) found=1 }
+            END {exit !found}'; then
+            red "TCP端口 $trojan_port 已被占用，请选择其他端口"
+            continue
+        fi
+        green "Trojan连接端口：$trojan_port；证书验证端口：80"
+        return 0
+    done
+}
+
 function install_trojan(){
+if [ "$(id -u)" -ne 0 ]; then
+    red "请先执行 sudo -i，再运行本脚本"
+    return 1
+fi
+$systemPackage -y install net-tools socat || return 1
+choose_trojan_port || return 1
 nginx_status=`ps -aux | grep "nginx: worker" |grep -v "grep"`
 if [ -n "$nginx_status" ]; then
     systemctl stop nginx
 fi
-$systemPackage -y install net-tools socat
 Port80=`netstat -tlpn | awk -F '[: ]+' '$1=="tcp"{print $5}' | grep -w 80`
-Port443=`netstat -tlpn | awk -F '[: ]+' '$1=="tcp"{print $5}' | grep -w 443`
 if [ -n "$Port80" ]; then
     process80=`netstat -tlpn | awk -F '[: ]+' '$5=="80"{print $9}'`
     red "==========================================================="
@@ -303,19 +336,12 @@ if [ -n "$Port80" ]; then
     red "==========================================================="
     exit 1
 fi
-if [ -n "$Port443" ]; then
-    process443=`netstat -tlpn | awk -F '[: ]+' '$5=="443"{print $9}'`
-    red "============================================================="
-    red "检测到443端口被占用，占用进程为：${process443}，本次安装结束"
-    red "============================================================="
-    exit 1
-fi
 CHECK=$(grep SELINUX= /etc/selinux/config | grep -v "#")
 if [ "$CHECK" != "SELINUX=disabled" ]; then
-    green "检测到SELinux开启状态，添加放行80/443端口规则"
+    green "检测到SELinux开启状态，添加放行80和${trojan_port}端口规则"
     yum install -y policycoreutils-python >/dev/null 2>&1
     semanage port -m -t http_port_t -p tcp 80
-    semanage port -m -t http_port_t -p tcp 443
+    semanage port -a -t http_port_t -p tcp "$trojan_port" 2>/dev/null || semanage port -m -t http_port_t -p tcp "$trojan_port"
 fi
 if [ "$release" == "centos" ]; then
     if  [ -n "$(grep ' 6\.' /etc/redhat-release)" ] ;then
@@ -332,10 +358,10 @@ if [ "$release" == "centos" ]; then
     fi
     firewall_status=`firewall-cmd --state`
     if [ "$firewall_status" == "running" ]; then
-        green "检测到firewalld开启状态，添加放行80/443端口规则"
+        green "检测到firewalld开启状态，添加放行80和${trojan_port}端口规则"
 	yum install -y policycoreutils-python >/dev/null 2>&1
         firewall-cmd --zone=public --add-port=80/tcp --permanent
-	firewall-cmd --zone=public --add-port=443/tcp --permanent
+	firewall-cmd --zone=public --add-port="${trojan_port}/tcp" --permanent
 	firewall-cmd --reload
     fi
     rpm -Uvh http://nginx.org/packages/centos/7/noarch/RPMS/nginx-release-centos-7-0.el7.ngx.noarch.rpm
@@ -355,14 +381,14 @@ elif [ "$release" == "ubuntu" ]; then
     ufw_status=`systemctl status ufw | grep "Active: active"`
     if [ -n "$ufw_status" ]; then
         ufw allow 80/tcp
-        ufw allow 443/tcp
+        ufw allow "${trojan_port}/tcp"
     fi
     apt-get update
 elif [ "$release" == "debian" ]; then
     ufw_status=`systemctl status ufw | grep "Active: active"`
     if [ -n "$ufw_status" ]; then
         ufw allow 80/tcp
-        ufw allow 443/tcp
+        ufw allow "${trojan_port}/tcp"
     fi
     apt-get update
 fi
@@ -461,7 +487,7 @@ start_menu(){
     green " Youtube：Randy's 堡垒                "
     blue " 声明："
     red " *请不要在任何生产环境使用此脚本"
-    red " *请不要有其他程序占用80和443端口"
+    red " *请保持80端口供Nginx验证证书，Trojan端口可自定义"
     red " *若是第二次使用脚本，请先执行卸载trojan"
     green " ======================================="
     echo
